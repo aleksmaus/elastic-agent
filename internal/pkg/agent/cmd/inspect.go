@@ -8,11 +8,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
 
 	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/service"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/filters"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/info"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
@@ -22,6 +24,7 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/program"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/storage"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/transpiler"
 	"github.com/elastic/elastic-agent/internal/pkg/capabilities"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
@@ -50,6 +53,7 @@ func newInspectCommandWithArgs(s []string, streams *cli.IOStreams) *cobra.Comman
 	}
 
 	cmd.AddCommand(newInspectOutputCommandWithArgs(s))
+	cmd.AddCommand(newInspectFleetCommandWithArgs(s, streams))
 
 	return cmd
 }
@@ -79,6 +83,29 @@ func newInspectOutputCommandWithArgs(_ []string) *cobra.Command {
 
 	cmd.Flags().StringP("output", "o", "", "name of the output to be inspected")
 	cmd.Flags().StringP("program", "p", "", "type of program to inspect, needs to be combined with output. e.g filebeat")
+
+	return cmd
+}
+
+func newInspectFleetCommandWithArgs(_ []string, streams *cli.IOStreams) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "fleet",
+		Short: "Displays the content of the fleet configuration.",
+		Long: `Displays the content of the fleet configuration.
+`,
+		Args: cobra.MaximumNArgs(1),
+		Run: func(c *cobra.Command, args []string) {
+			dir, _ := c.Flags().GetString("dir")
+			ctx, cancel := context.WithCancel(context.Background())
+			service.HandleSignals(func() {}, cancel)
+			if err := inspectFleet(ctx, dir, streams); err != nil {
+				fmt.Fprintf(streams.Err, "Error: %v\n%s\n", err, troubleshootMessage())
+				os.Exit(1)
+			}
+		},
+	}
+
+	cmd.Flags().String("dir", "", "path to the directory that contains fleet.inc file and vault directory")
 
 	return cmd
 }
@@ -160,6 +187,53 @@ func inspectOutputs(cfgPath string, agentInfo *info.AgentInfo) error {
 	}
 
 	return listOutputsFromMap(l, agentInfo, fleetConfig, isStandalone)
+}
+
+func inspectFleet(ctx context.Context, dir string, streams *cli.IOStreams) error {
+	if dir == "" {
+		dir = filepath.Dir(paths.AgentConfigFile())
+	}
+	fleetFilePath := filepath.Join(dir, "fleet.enc")
+	vaultPath := filepath.Join(dir, "vault")
+
+	_, _ = streams.Out.Write([]byte(fmt.Sprintln("Fleet configuration file path:", fleetFilePath)))
+	_, _ = streams.Out.Write([]byte(fmt.Sprintln("Vault directory path:", vaultPath)))
+	_, _ = streams.Out.Write([]byte("\n"))
+	_, err := os.Stat(fleetFilePath)
+	if err != nil {
+		return fmt.Errorf("failed accessing %v: %w", fleetFilePath, err)
+	}
+
+	_, err = os.Stat(vaultPath)
+	if err != nil {
+		return fmt.Errorf("failed accessing %v: %w", vaultPath, err)
+	}
+
+	store := storage.NewEncryptedDiskStore(fleetFilePath, storage.WithVaultPath(vaultPath))
+	reader, err := store.Load()
+	if err != nil {
+		return errors.New(err, "could not initialize config store",
+			errors.TypeFilesystem,
+			errors.M(errors.MetaKeyPath, fleetFilePath))
+	}
+
+	config, err := config.NewConfigFrom(reader)
+	if err != nil {
+		return err
+	}
+
+	mapStr, err := config.ToMapStr()
+	if err != nil {
+		return err
+	}
+
+	data, err := yaml.Marshal(mapStr)
+	if err != nil {
+		return errors.New(err, "could not marshal to YAML")
+	}
+
+	_, _ = streams.Out.Write(data)
+	return nil
 }
 
 func listOutputsFromConfig(log *logger.Logger, agentInfo *info.AgentInfo, cfg *config.Config, isStandalone bool) error {
