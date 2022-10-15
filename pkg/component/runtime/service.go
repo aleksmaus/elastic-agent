@@ -282,7 +282,7 @@ func (s *ServiceRuntime) start(ctx context.Context, comm Communicator, cli servi
 		}
 	}
 
-	// Check service status if it's already running
+	// Check service status if it's already running, should error here if still not installed
 	s.log.Debugf("check %s service status", name)
 	status, err := cli.Status()
 	s.log.Debugf("after %s service status check, status: %v, err: %v", name, status, err)
@@ -296,7 +296,10 @@ func (s *ServiceRuntime) start(ctx context.Context, comm Communicator, cli servi
 	err = cli.Start()
 	s.log.Debugf("after %s service start with the service managers, err: %v", name, err)
 	if err != nil {
-		return fmt.Errorf("failed starting %s service: %w", name, err)
+		// The start can fail on windows when the service is already running for example
+		// returning "An instance of the service is already running"
+		// Log the error and await check-ins on the main loop
+		s.log.Errorf("failed starting %s service: %v", name, err)
 	}
 	return nil
 }
